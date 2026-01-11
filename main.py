@@ -1,10 +1,11 @@
 import os
 import logging
 import uuid
+import asyncio
 from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from supabase import create_client
@@ -12,7 +13,7 @@ from supabase import create_client
 # تحميل المتغيرات من ملف .env
 load_dotenv()
 
-# إعدادات السجلات
+# إعداد السجلات
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -73,7 +74,7 @@ else:
     model = None
     logger.warning("GEMINI_API_KEY غير موجود!")
 
-# إعداد Supabase باستخدام create_client فقط
+# إعداد Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = None
@@ -232,17 +233,23 @@ def main():
     if not BOT_TOKEN or BOT_TOKEN == "your_bot_token_here":
         print("❌ TELEGRAM_TOKEN غير موجود أو غير صالح!")
         return
-    try:
-        from telegram import Bot
-        test_bot = Bot(token=BOT_TOKEN)
-        bot_info = test_bot.get_me()
+
+    # فحص البوت باستخدام asyncio
+    async def test_bot():
+        bot = Bot(BOT_TOKEN)
+        bot_info = await bot.get_me()
         print(f"✅ تم الاتصال بالبوت: @{bot_info.username}")
+
+    try:
+        asyncio.run(test_bot())
     except Exception as e:
         print(f"❌ خطأ في الاتصال بالبوت: {e}")
         return
+
     print("\n🚀 جارٍ تشغيل البوت...")
     print(f"ℹ️  Gemini API: {'متاح ✓' if model else 'غير متاح ✗'}")
     print(f"ℹ️  Supabase: {'متاح ✓' if supabase else 'غير متاح ✗'}\n")
+
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
