@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
-from supabase import create_client, Client
+from supabase import SyncClient
+from gotrue import SyncGoTrueClient
 
 # تحميل المتغيرات من ملف .env
 load_dotenv()
@@ -73,14 +74,23 @@ else:
     model = None
     logger.warning("GEMINI_API_KEY غير موجود!")
 
-# إعداد Supabase
+# إعداد Supabase بدون create_client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = None
+supabase: SyncClient = None
+auth_client: SyncGoTrueClient = None
 
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("تم الاتصال بـ Supabase بنجاح")
+    try:
+        # إنشاء عميل Supabase
+        supabase = SyncClient(SUPABASE_URL, SUPABASE_KEY, options={})
+        
+        # إنشاء Auth Client منفصل
+        auth_client = SyncGoTrueClient(SUPABASE_URL, supabase)
+        
+        logger.info("تم الاتصال بـ Supabase وAuth بنجاح")
+    except Exception as e:
+        logger.error(f"خطأ أثناء إنشاء عميل Supabase: {e}")
 else:
     logger.warning("Supabase credentials غير موجودة!")
 
@@ -91,8 +101,6 @@ def init_database():
         return
     
     try:
-        # محاولة إنشاء جدول المحادثات
-        # ملاحظة: يجب إنشاء الجدول يدوياً في Supabase أو استخدام migrations
         logger.info("قاعدة البيانات جاهزة")
     except Exception as e:
         logger.error(f"خطأ في تهيئة قاعدة البيانات: {e}")
@@ -101,13 +109,11 @@ def init_database():
 user_sessions: Dict[int, str] = {}
 
 def get_or_create_session(user_id: int) -> str:
-    """الحصول على session_id للمستخدم أو إنشاء واحد جديد"""
     if user_id not in user_sessions:
         user_sessions[user_id] = str(uuid.uuid4())
     return user_sessions[user_id]
 
 def save_conversation(user_id: int, username: str, message: str, response: str, session_id: str):
-    """حفظ المحادثة في Supabase"""
     if not supabase:
         return
     
@@ -126,57 +132,41 @@ def save_conversation(user_id: int, username: str, message: str, response: str, 
         logger.error(f"خطأ في حفظ المحادثة: {e}")
 
 def get_conversation_history(user_id: int, session_id: str = None, limit: int = 5) -> List[Dict]:
-    """جلب تاريخ المحادثات للمستخدم"""
     if not supabase:
         return []
     
     try:
-        query = supabase.table("conversations")\
-            .select("*")\
-            .eq("user_id", user_id)
-        
+        query = supabase.table("conversations").select("*").eq("user_id", user_id)
         if session_id:
             query = query.eq("session_id", session_id)
-        
-        response = query.order("timestamp", desc=True)\
-            .limit(limit)\
-            .execute()
+        response = query.order("timestamp", desc=True).limit(limit).execute()
         return response.data if response.data else []
     except Exception as e:
         logger.error(f"خطأ في جلب تاريخ المحادثات: {e}")
         return []
 
 def handle_special_questions(user_message: str) -> str:
-    """معالجة الأسئلة الخاصة"""
     message_lower = user_message.lower().strip()
     
-    # سؤال عن الهوية
     if any(word in message_lower for word in ["مين أنت", "من أنت", "شو اسمك", "تعرف نفسك"]):
         return "أنا أنس ربايعة 👨‍💻 مبرمج ذكاء اصطناعي من فلسطين، متخصص ببناء حلول تقنية ذكية. درست GIS وصار عندي خبرة قوية بالـ AI والويب ديفلوبمنت 🚀"
     
-    # سؤال عن السعر
     if any(word in message_lower for word in ["كم سعر", "بكم", "السعر", "التكلفة", "الثمن"]):
         return "الأسعار تختلف حسب المشروع والمميزات 💰 لكن أضمنلك أسعار منافسة وجودة عالية. حاب تحكيلي عن مشروعك وبعطيك سعر مناسب؟"
     
-    # سؤال عن التواصل
     if any(word in message_lower for word in ["كيف أتواصل", "رابط", "لينكد إن", "linkedin", "تواصل"]):
         return f"تواصل معي على LinkedIn للمشاريع الجدية: {DIGITAL_SELF['linkedin']} 💼"
     
-    # سؤال عن أمثلة أعمال
     if any(word in message_lower for word in ["أمثلة", "مشاريع", "أعمال", "portfolio", "أعمالك"]):
         return "بشتغل على مشاريع متنوعة: بوتات ذكية للشركات، مواقع ويب تفاعلية، أنظمة أتمتة، وحلول AI مخصصة. حاب تشوف أمثلة لنوع معين؟ 💼"
     
     return None
 
 def generate_response(user_message: str, user_id: int, session_id: str) -> str:
-    """إنشاء رد ذكي باستخدام Gemini API"""
-    
-    # التحقق من الأسئلة الخاصة أولاً (يعمل حتى بدون Gemini)
     special_response = handle_special_questions(user_message)
     if special_response:
         return special_response
     
-    # إذا لم يكن Gemini متاحاً، أرسل رد افتراضي
     if not model:
         logger.warning("Gemini API غير متاح - استخدام رد افتراضي")
         return """مرحباً! 👋
@@ -193,23 +183,14 @@ def generate_response(user_message: str, user_id: int, session_id: str) -> str:
 https://www.linkedin.com/in/anas-rabaya 💼"""
     
     try:
-        # جلب تاريخ المحادثات السابقة من نفس الجلسة
         history = get_conversation_history(user_id, session_id, limit=5)
-        
-        # بناء السياق
         context = SYSTEM_PROMPT
-        
-        # إضافة تاريخ المحادثات للسياق
         if history:
             context += "\n\nالمحادثات السابقة في هذه الجلسة:\n"
             for conv in reversed(history):
                 context += f"المستخدم: {conv.get('message', '')}\n"
                 context += f"أنت: {conv.get('response', '')}\n\n"
-        
-        # إضافة الرسالة الحالية
         prompt = f"{context}\n\nالمستخدم: {user_message}\nأنت:"
-        
-        # توليد الرد
         response = model.generate_content(prompt)
         return response.text.strip()
     
@@ -217,16 +198,11 @@ https://www.linkedin.com/in/anas-rabaya 💼"""
         logger.error(f"خطأ في توليد الرد: {e}")
         import traceback
         traceback.print_exc()
-        # رد احتياطي عند فشل Gemini
         return "عذراً، حدث خطأ أثناء معالجة رسالتك. لكن يمكنني مساعدتك! تواصل معي على LinkedIn: https://www.linkedin.com/in/anas-rabaya 💼"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج أمر /start"""
     user_id = update.effective_user.id
-    
-    # إنشاء جلسة جديدة عند /start
-    user_sessions[user_id] = str(uuid.uuid4())  # جلسة جديدة
-    
+    user_sessions[user_id] = str(uuid.uuid4())
     welcome_message = """مرحباً! 👋
 
 أنا أنس ربايعة - نسخة رقمية ذكية
@@ -239,33 +215,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 أي مشروع في بالك، أقدر أساعدك فيه بجودة عالية وأسعار منافسة
 
 كيف أقدر أخدمك؟ 🚀"""
-    
     await update.message.reply_text(welcome_message)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الرسائل النصية"""
     try:
         user = update.effective_user
         user_message = update.message.text
-        
         if not user_message:
             return
-        
         logger.info(f"رسالة من {user.id} ({user.username}): {user_message}")
-        
-        # الحصول على session_id
         session_id = get_or_create_session(user.id)
-        
-        # إظهار حالة الكتابة
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        
-        # توليد الرد
         response = generate_response(user_message, user.id, session_id)
-        
-        # إرسال الرد
         await update.message.reply_text(response)
-        
-        # حفظ المحادثة
         save_conversation(
             user_id=user.id,
             username=user.username or user.first_name or "unknown",
@@ -273,9 +235,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response=response,
             session_id=session_id
         )
-        
         logger.info(f"تم إرسال الرد للمستخدم {user.id}")
-        
     except Exception as e:
         logger.error(f"خطأ في معالجة الرسالة: {e}")
         import traceback
@@ -286,10 +246,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الأخطاء"""
     logger.error(f"حدث خطأ: {context.error}")
-    
-    # إرسال رسالة خطأ لطيفة للمستخدم
     if update and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -299,21 +256,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def main():
-    """الدالة الرئيسية لتشغيل البوت"""
-    # الحصول على توكن البوت
     BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    
-    if not BOT_TOKEN:
-        print("❌ خطأ: TELEGRAM_TOKEN غير موجود في ملف .env!")
-        print("تأكد من وجود ملف .env وأنه يحتوي على TELEGRAM_TOKEN")
+    if not BOT_TOKEN or BOT_TOKEN == "your_bot_token_here":
+        print("❌ TELEGRAM_TOKEN غير موجود أو غير صالح!")
         return
-    
-    if BOT_TOKEN == "your_bot_token_here":
-        print("❌ خطأ: التوكن غير محدد!")
-        print("يرجى إضافة التوكن الصحيح في ملف .env")
-        return
-    
-    # اختبار الاتصال بالبوت
     try:
         from telegram import Bot
         test_bot = Bot(token=BOT_TOKEN)
@@ -321,34 +267,20 @@ def main():
         print(f"✅ تم الاتصال بالبوت: @{bot_info.username}")
     except Exception as e:
         print(f"❌ خطأ في الاتصال بالبوت: {e}")
-        print("\nالأسباب المحتملة:")
-        print("  1. التوكن غير صحيح")
-        print("  2. لا يوجد اتصال بالإنترنت")
-        print("  3. البوت تم حذفه أو تعطيله")
         return
-    
-    # تهيئة قاعدة البيانات
     init_database()
-    
-    # إنشاء التطبيق
     try:
         application = Application.builder().token(BOT_TOKEN).build()
-        
-        # إضافة المعالجات
         application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_error_handler(error_handler)
-        
-        # بدء البوت
         print("\n🚀 جارٍ تشغيل البوت...")
-        print("📱 افتح Telegram وابحث عن بوتك وأرسل /start")
-        print("⏹️  اضغط Ctrl+C لإيقاف البوت\n")
         print(f"ℹ️  Gemini API: {'متاح ✓' if model else 'غير متاح ✗'}")
         print(f"ℹ️  Supabase: {'متاح ✓' if supabase else 'غير متاح ✗'}\n")
         logger.info("جارٍ تشغيل البوت...")
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True  # تجاهل الرسائل القديمة
+            drop_pending_updates=True
         )
     except KeyboardInterrupt:
         print("\n\n⏹️  تم إيقاف البوت")
