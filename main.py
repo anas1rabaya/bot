@@ -7,8 +7,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
-from supabase import SyncClient
-from gotrue import SyncGoTrueClient
+from supabase import create_client
 
 # تحميل المتغيرات من ملف .env
 load_dotenv()
@@ -74,36 +73,19 @@ else:
     model = None
     logger.warning("GEMINI_API_KEY غير موجود!")
 
-# إعداد Supabase بدون create_client
+# إعداد Supabase باستخدام create_client فقط
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: SyncClient = None
-auth_client: SyncGoTrueClient = None
+supabase = None
 
 if SUPABASE_URL and SUPABASE_KEY:
     try:
-        # إنشاء عميل Supabase
-        supabase = SyncClient(SUPABASE_URL, SUPABASE_KEY, options={})
-        
-        # إنشاء Auth Client منفصل
-        auth_client = SyncGoTrueClient(SUPABASE_URL, supabase)
-        
-        logger.info("تم الاتصال بـ Supabase وAuth بنجاح")
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("تم الاتصال بـ Supabase بنجاح")
     except Exception as e:
-        logger.error(f"خطأ أثناء إنشاء عميل Supabase: {e}")
+        logger.error(f"خطأ أثناء الاتصال بـ Supabase: {e}")
 else:
     logger.warning("Supabase credentials غير موجودة!")
-
-# إنشاء جدول المحادثات في Supabase (إذا لم يكن موجوداً)
-def init_database():
-    """تهيئة قاعدة البيانات"""
-    if not supabase:
-        return
-    
-    try:
-        logger.info("قاعدة البيانات جاهزة")
-    except Exception as e:
-        logger.error(f"خطأ في تهيئة قاعدة البيانات: {e}")
 
 # تخزين session_id لكل مستخدم
 user_sessions: Dict[int, str] = {}
@@ -116,7 +98,6 @@ def get_or_create_session(user_id: int) -> str:
 def save_conversation(user_id: int, username: str, message: str, response: str, session_id: str):
     if not supabase:
         return
-    
     try:
         data = {
             "user_id": user_id,
@@ -134,7 +115,6 @@ def save_conversation(user_id: int, username: str, message: str, response: str, 
 def get_conversation_history(user_id: int, session_id: str = None, limit: int = 5) -> List[Dict]:
     if not supabase:
         return []
-    
     try:
         query = supabase.table("conversations").select("*").eq("user_id", user_id)
         if session_id:
@@ -147,26 +127,20 @@ def get_conversation_history(user_id: int, session_id: str = None, limit: int = 
 
 def handle_special_questions(user_message: str) -> str:
     message_lower = user_message.lower().strip()
-    
     if any(word in message_lower for word in ["مين أنت", "من أنت", "شو اسمك", "تعرف نفسك"]):
         return "أنا أنس ربايعة 👨‍💻 مبرمج ذكاء اصطناعي من فلسطين، متخصص ببناء حلول تقنية ذكية. درست GIS وصار عندي خبرة قوية بالـ AI والويب ديفلوبمنت 🚀"
-    
     if any(word in message_lower for word in ["كم سعر", "بكم", "السعر", "التكلفة", "الثمن"]):
         return "الأسعار تختلف حسب المشروع والمميزات 💰 لكن أضمنلك أسعار منافسة وجودة عالية. حاب تحكيلي عن مشروعك وبعطيك سعر مناسب؟"
-    
     if any(word in message_lower for word in ["كيف أتواصل", "رابط", "لينكد إن", "linkedin", "تواصل"]):
         return f"تواصل معي على LinkedIn للمشاريع الجدية: {DIGITAL_SELF['linkedin']} 💼"
-    
     if any(word in message_lower for word in ["أمثلة", "مشاريع", "أعمال", "portfolio", "أعمالك"]):
         return "بشتغل على مشاريع متنوعة: بوتات ذكية للشركات، مواقع ويب تفاعلية، أنظمة أتمتة، وحلول AI مخصصة. حاب تشوف أمثلة لنوع معين؟ 💼"
-    
     return None
 
 def generate_response(user_message: str, user_id: int, session_id: str) -> str:
     special_response = handle_special_questions(user_message)
     if special_response:
         return special_response
-    
     if not model:
         logger.warning("Gemini API غير متاح - استخدام رد افتراضي")
         return """مرحباً! 👋
@@ -181,7 +155,6 @@ def generate_response(user_message: str, user_id: int, session_id: str) -> str:
 
 تواصل معي على LinkedIn للمشاريع الجدية:
 https://www.linkedin.com/in/anas-rabaya 💼"""
-    
     try:
         history = get_conversation_history(user_id, session_id, limit=5)
         context = SYSTEM_PROMPT
@@ -193,12 +166,11 @@ https://www.linkedin.com/in/anas-rabaya 💼"""
         prompt = f"{context}\n\nالمستخدم: {user_message}\nأنت:"
         response = model.generate_content(prompt)
         return response.text.strip()
-    
     except Exception as e:
         logger.error(f"خطأ في توليد الرد: {e}")
         import traceback
         traceback.print_exc()
-        return "عذراً، حدث خطأ أثناء معالجة رسالتك. لكن يمكنني مساعدتك! تواصل معي على LinkedIn: https://www.linkedin.com/in/anas-rabaya 💼"
+        return "عذراً، حدث خطأ أثناء معالجة رسالتك. تواصل معي على LinkedIn: https://www.linkedin.com/in/anas-rabaya 💼"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -268,25 +240,17 @@ def main():
     except Exception as e:
         print(f"❌ خطأ في الاتصال بالبوت: {e}")
         return
-    init_database()
-    try:
-        application = Application.builder().token(BOT_TOKEN).build()
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        application.add_error_handler(error_handler)
-        print("\n🚀 جارٍ تشغيل البوت...")
-        print(f"ℹ️  Gemini API: {'متاح ✓' if model else 'غير متاح ✗'}")
-        print(f"ℹ️  Supabase: {'متاح ✓' if supabase else 'غير متاح ✗'}\n")
-        logger.info("جارٍ تشغيل البوت...")
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-    except KeyboardInterrupt:
-        print("\n\n⏹️  تم إيقاف البوت")
-    except Exception as e:
-        print(f"\n❌ خطأ أثناء تشغيل البوت: {e}")
-        logger.error(f"خطأ أثناء تشغيل البوت: {e}")
+    print("\n🚀 جارٍ تشغيل البوت...")
+    print(f"ℹ️  Gemini API: {'متاح ✓' if model else 'غير متاح ✗'}")
+    print(f"ℹ️  Supabase: {'متاح ✓' if supabase else 'غير متاح ✗'}\n")
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
